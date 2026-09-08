@@ -1,0 +1,15 @@
+[package]
+name = "rs-lru"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "An O(1) get/put LRU cache built on a safe index-based arena and intrusive doubly-linked list, with zero external dependencies."
+repository = "https://github.com/kasapdev/rs-lru"
+readme = "README.md"
+keywords = ["lru", "cache", "data-structures"]
+categories = ["data-structures", "caching"]
+
+[dependencies]
+# Intentionally empty: the standard library (HashMap, Vec) is sufficient
+# to implement an O(1) LRU cache via an index-based arena, so no external
+# crates are used.
