@@ -224,6 +224,106 @@ where
         self.attach_front(idx);
     }
 
+    /// Removes `key` from the cache, returning its value if it was present.
+    ///
+    /// The freed arena slot is recycled by later `put` calls. Removing a key
+    /// does not affect the relative recency of the remaining entries.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rs_lru::LruCache;
+    ///
+    /// let mut cache = LruCache::new(2);
+    /// cache.put("a", 1);
+    /// assert_eq!(cache.remove(&"a"), Some(1));
+    /// assert_eq!(cache.remove(&"a"), None);
+    /// assert!(cache.is_empty());
+    /// ```
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let idx = self.map.remove(key)?;
+        self.detach(idx);
+        let node = self.arena[idx]
+            .take()
+            .expect("rs-lru: arena index referenced by map must be occupied");
+        self.free.push(idx);
+        Some(node.value)
+    }
+
+    /// Removes and returns the least-recently-used entry, or `None` if the
+    /// cache is empty. This is the entry the next over-capacity `put` would
+    /// evict, so it is useful for draining a cache oldest-first or for
+    /// handling evictions yourself.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rs_lru::LruCache;
+    ///
+    /// let mut cache = LruCache::new(3);
+    /// cache.put("a", 1);
+    /// cache.put("b", 2);
+    /// cache.get(&"a"); // "b" is now the least-recently-used entry
+    /// assert_eq!(cache.pop_lru(), Some(("b", 2)));
+    /// assert_eq!(cache.pop_lru(), Some(("a", 1)));
+    /// assert_eq!(cache.pop_lru(), None);
+    /// ```
+    pub fn pop_lru(&mut self) -> Option<(K, V)> {
+        let tail_idx = self.tail?;
+        self.detach(tail_idx);
+        let removed = self.arena[tail_idx]
+            .take()
+            .expect("rs-lru: tail index must be occupied");
+        self.map.remove(&removed.key);
+        self.free.push(tail_idx);
+        Some((removed.key, removed.value))
+    }
+
+    /// Removes every entry. The capacity is unchanged and the cache can be
+    /// used again immediately.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rs_lru::LruCache;
+    ///
+    /// let mut cache = LruCache::new(2);
+    /// cache.put("a", 1);
+    /// cache.clear();
+    /// assert!(cache.is_empty());
+    /// assert_eq!(cache.capacity(), 2);
+    /// ```
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.arena.clear();
+        self.free.clear();
+        self.head = None;
+        self.tail = None;
+    }
+
+    /// Iterates over the entries from most- to least-recently-used without
+    /// changing any recency (like [`LruCache::peek`]).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rs_lru::LruCache;
+    ///
+    /// let mut cache = LruCache::new(3);
+    /// cache.put("a", 1);
+    /// cache.put("b", 2);
+    /// cache.put("c", 3);
+    /// cache.get(&"a");
+    /// let keys: Vec<_> = cache.iter().map(|(k, _)| *k).collect();
+    /// assert_eq!(keys, ["a", "c", "b"]);
+    /// ```
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            cache: self,
+            next: self.head,
+        }
+    }
+
     // ---- internal helpers -------------------------------------------------
 
     /// Borrows the node at `idx`.
@@ -320,15 +420,27 @@ where
     /// it from the recency list, the map, and freeing its arena slot for
     /// reuse. No-op if the cache is empty.
     fn evict_lru(&mut self) {
-        let Some(tail_idx) = self.tail else {
-            return;
-        };
-        self.detach(tail_idx);
-        let removed = self.arena[tail_idx]
-            .take()
-            .expect("rs-lru: tail index must be occupied");
-        self.map.remove(&removed.key);
-        self.free.push(tail_idx);
+        self.pop_lru();
+    }
+}
+
+/// Iterator over a cache's entries from most- to least-recently-used, created
+/// by [`LruCache::iter`].
+pub struct Iter<'a, K, V> {
+    cache: &'a LruCache<K, V>,
+    next: Option<usize>,
+}
+
+impl<'a, K, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let idx = self.next?;
+        let node = self.cache.arena[idx]
+            .as_ref()
+            .expect("rs-lru: arena index referenced by list must be occupied");
+        self.next = node.next;
+        Some((&node.key, &node.value))
     }
 }
 
@@ -497,5 +609,107 @@ mod tests {
     #[should_panic(expected = "capacity must be greater than zero")]
     fn zero_capacity_panics() {
         let _cache: LruCache<i32, i32> = LruCache::new(0);
+    }
+
+    #[test]
+    fn remove_returns_value_and_frees_the_slot() {
+        let mut cache = LruCache::new(2);
+        cache.put("a", 1);
+        cache.put("b", 2);
+
+        assert_eq!(cache.remove(&"a"), Some(1));
+        assert_eq!(cache.remove(&"a"), None);
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains_key(&"a"));
+
+        // The vacated slot is reusable and the cache is not over capacity.
+        cache.put("c", 3);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&"b") && cache.contains_key(&"c"));
+    }
+
+    #[test]
+    fn remove_middle_head_and_tail_keeps_the_list_consistent() {
+        let mut cache = LruCache::new(4);
+        for (k, v) in [("a", 1), ("b", 2), ("c", 3), ("d", 4)] {
+            cache.put(k, v);
+        } // recency (MRU..LRU): d c b a
+
+        cache.remove(&"c"); // middle
+        cache.remove(&"d"); // head
+        cache.remove(&"a"); // tail
+        let keys: Vec<_> = cache.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["b"]);
+
+        cache.remove(&"b");
+        assert!(cache.is_empty());
+        assert_eq!(cache.iter().count(), 0);
+        assert_eq!(cache.pop_lru(), None);
+
+        // Fully usable again after being emptied entry by entry.
+        cache.put("x", 9);
+        assert_eq!(cache.get(&"x"), Some(&9));
+    }
+
+    #[test]
+    fn remove_does_not_disturb_relative_recency() {
+        let mut cache = LruCache::new(3);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        cache.put("c", 3); // c b a
+        cache.remove(&"b"); // c a
+        cache.put("d", 4); // d c a (at capacity, nothing evicted)
+        cache.put("e", 5); // evicts a, the true LRU
+        assert!(!cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"c") && cache.contains_key(&"d") && cache.contains_key(&"e"));
+    }
+
+    #[test]
+    fn pop_lru_drains_oldest_first_respecting_recency() {
+        let mut cache = LruCache::new(3);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        cache.put("c", 3);
+        cache.get(&"a"); // a c b
+
+        assert_eq!(cache.pop_lru(), Some(("b", 2)));
+        assert_eq!(cache.pop_lru(), Some(("c", 3)));
+        assert_eq!(cache.pop_lru(), Some(("a", 1)));
+        assert_eq!(cache.pop_lru(), None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn clear_empties_but_keeps_capacity_and_stays_usable() {
+        let mut cache = LruCache::new(2);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        cache.clear();
+
+        assert!(cache.is_empty());
+        assert_eq!(cache.capacity(), 2);
+        assert_eq!(cache.iter().count(), 0);
+
+        cache.put("x", 1);
+        cache.put("y", 2);
+        cache.put("z", 3); // evicts x
+        assert!(!cache.contains_key(&"x"));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn iter_is_mru_first_and_does_not_change_recency() {
+        let mut cache = LruCache::new(3);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        cache.put("c", 3);
+        cache.get(&"a");
+
+        let pairs: Vec<_> = cache.iter().map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(pairs, [("a", 1), ("c", 3), ("b", 2)]);
+
+        // Iterating must not have promoted anything: "b" is still the LRU.
+        cache.put("d", 4);
+        assert!(!cache.contains_key(&"b"));
     }
 }
