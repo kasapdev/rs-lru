@@ -48,6 +48,27 @@ fn main() {
 }
 ```
 
+Beyond `get`/`put`/`peek`, entries can be taken out and inspected:
+
+```rust
+use rs_lru::LruCache;
+
+let mut cache = LruCache::new(3);
+cache.put("a", 1);
+cache.put("b", 2);
+cache.put("c", 3);
+cache.get(&"a");
+
+// Iterate most- to least-recently-used without changing recency.
+let keys: Vec<_> = cache.iter().map(|(k, _)| *k).collect();
+assert_eq!(keys, ["a", "c", "b"]);
+
+assert_eq!(cache.remove(&"c"), Some(3)); // remove a specific key
+assert_eq!(cache.pop_lru(), Some(("b", 2))); // remove the oldest entry
+cache.clear(); // drop everything, keep the capacity
+assert!(cache.is_empty());
+```
+
 Add it to a project with:
 
 ```toml
