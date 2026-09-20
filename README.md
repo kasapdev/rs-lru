@@ -73,7 +73,7 @@ Add it to a project with:
 
 ```toml
 [dependencies]
-rs-lru = "1.0"
+rs-lru = "1.1"
 ```
 
 ## How it works
